@@ -127,6 +127,10 @@ def _insert_cell(row: ET.Element, ref: str) -> ET.Element:
     return cell
 
 
+def _had_formula(cell: ET.Element) -> bool:
+    return cell.find(_q("f")) is not None
+
+
 def _set_value(cell: ET.Element, value: Any) -> None:
     """写值。字符串走 inline string,绕开 sharedStrings。
 
@@ -165,8 +169,14 @@ def _set_value(cell: ET.Element, value: Any) -> None:
 # ---------------------------------------------------------------- 片段改写
 
 
-def _apply_cells(sheet_xml: bytes, cells: Mapping[str, Any]) -> bytes:
-    """只重写 <sheetData> 这一段,工作表其余字节原样保留。"""
+def _apply_cells(sheet_xml: bytes, cells: Mapping[str, Any]) -> tuple[bytes, set[str]]:
+    """只重写 <sheetData> 这一段,工作表其余字节原样保留。
+
+    返回改写后的 XML,以及「原本有公式、被这次写值清掉了」的单元格引用集合 ——
+    调用方要拿它去同步 calcChain,否则留下悬空引用。
+    """
+    cleared_formulas: set[str] = set()
+
     m = _SHEETDATA_RE.search(sheet_xml)
     if not m:
         raise XlsxFaithfulError("工作表 XML 里找不到 <sheetData>")
@@ -197,13 +207,53 @@ def _apply_cells(sheet_xml: bytes, cells: Mapping[str, Any]) -> bytes:
         if cell is None:
             cell = _insert_cell(row, ref)
 
+        if _had_formula(cell):
+            cleared_formulas.add(ref)
         _set_value(cell, value)
 
     new_fragment = ET.tostring(sheet_data, encoding="utf-8")
     # ET 会在片段根上补一个 xmlns 声明,原文里没有,去掉
     new_fragment = new_fragment.replace(b' xmlns="' + NS.encode() + b'"', b"", 1)
 
-    return sheet_xml[: m.start()] + new_fragment + sheet_xml[m.end() :]
+    return sheet_xml[: m.start()] + new_fragment + sheet_xml[m.end() :], cleared_formulas
+
+
+# ---------------------------------------------------------------- calcChain
+
+_CALC_CHAIN = "xl/calcChain.xml"
+_CT = "[Content_Types].xml"
+_WB_RELS = "xl/_rels/workbook.xml.rels"
+
+
+def _prune_calc_chain(chain_xml: bytes, cleared: set[str]) -> bytes | None:
+    """从 calcChain 里删掉指定单元格的记录。全删空了返回 None。
+
+    calcChain 记的是「哪些格子有公式、按什么顺序算」。写值会把 <f> 清掉,
+    这里的记录不跟着删就成了指向「已经没有公式的格子」的悬空引用,
+    Excel 打开时可能提示「发现不可读取的内容」。
+
+    用正则而不是解析重写:和整体思路一致 —— 能不重新生成就不重新生成。
+    """
+    remaining = chain_xml
+    for ref in cleared:
+        remaining = re.sub(
+            rb'<c r="' + re.escape(ref.encode()) + rb'"[^>]*/>', b"", remaining
+        )
+    if not re.search(rb"<c\s", remaining):
+        return None
+    return remaining
+
+
+def _drop_part_registrations(data: bytes, filename: str) -> bytes:
+    """把 [Content_Types].xml / workbook.xml.rels 里对某个零件的登记去掉。
+
+    删了零件却留着登记,就是把悬空引用换个地方犯一遍。
+    """
+    if filename == _CT:
+        return re.sub(rb'<Override PartName="/xl/calcChain\.xml"[^>]*/>', b"", data)
+    if filename == _WB_RELS:
+        return re.sub(rb'<Relationship[^>]*Target="calcChain\.xml"[^>]*/>', b"", data)
+    return data
 
 
 # ---------------------------------------------------------------- 公开 API
@@ -244,11 +294,31 @@ def write_cells(
                 f"{[n for n in zin.namelist() if n.startswith('xl/worksheets/')]}"
             )
 
-        new_sheet = _apply_cells(zin.read(sheet), cells)
+        new_sheet, cleared_formulas = _apply_cells(zin.read(sheet), cells)
+
+        # 覆盖了公式格就得同步 calcChain,否则留下悬空引用。
+        # drop_calc_chain 为真时,这个零件连同它在 Content_Types / workbook
+        # 关联里的登记一起去掉 —— 这是「零件一个不少」唯一的例外,
+        # 因为 Excel 自己在没有公式时也不写这个零件,留个空的反而可能被判损坏。
+        new_calc_chain: bytes | None = None
+        drop_calc_chain = False
+        if cleared_formulas and _CALC_CHAIN in zin.namelist():
+            new_calc_chain = _prune_calc_chain(zin.read(_CALC_CHAIN), cleared_formulas)
+            drop_calc_chain = new_calc_chain is None
 
         dst.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
+                if drop_calc_chain and item.filename == _CALC_CHAIN:
+                    continue
+
                 # 传 ZipInfo 而不是文件名,保留原始时间戳和压缩方式
-                data = new_sheet if item.filename == sheet else zin.read(item.filename)
+                if item.filename == sheet:
+                    data = new_sheet
+                elif item.filename == _CALC_CHAIN and new_calc_chain is not None:
+                    data = new_calc_chain
+                else:
+                    data = zin.read(item.filename)
+                    if drop_calc_chain:
+                        data = _drop_part_registrations(data, item.filename)
                 zout.writestr(item, data)
